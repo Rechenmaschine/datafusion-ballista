@@ -1248,8 +1248,30 @@ impl ExecutionGraph for StaticExecutionGraph {
     /// Convert running stage to be successful
     fn succeed_stage(&mut self, stage_id: usize) -> bool {
         if let Some(ExecutionStage::Running(stage)) = self.stages.remove(&stage_id) {
+            let successful = stage.to_successful();
+            // CARMA out-of-tree hook: fire the process-wide listener (if any)
+            // before reinserting, so the listener sees the freshly-completed
+            // stage with no chance of overlap from later state changes.
+            if let Some(listener) =
+                crate::state::stage_listener::stage_completion_listener()
+            {
+                listener.on_stage_succeeded(
+                    crate::state::stage_listener::StageCompletionContext {
+                        job_id: &self.job_id,
+                        stage_id,
+                        stage_attempt_num: successful.stage_attempt_num,
+                        partitions: successful.partitions,
+                        output_links: &successful.output_links,
+                        plan: &successful.plan,
+                        inputs: &successful.inputs,
+                        task_infos: &successful.task_infos,
+                        stage_metrics: &successful.stage_metrics,
+                        session_config: &self.session_config,
+                    },
+                );
+            }
             self.stages
-                .insert(stage_id, ExecutionStage::Successful(stage.to_successful()));
+                .insert(stage_id, ExecutionStage::Successful(successful));
             self.clear_stage_failure(stage_id);
             true
         } else {
