@@ -1249,12 +1249,12 @@ impl ExecutionGraph for StaticExecutionGraph {
     fn succeed_stage(&mut self, stage_id: usize) -> bool {
         if let Some(ExecutionStage::Running(stage)) = self.stages.remove(&stage_id) {
             let successful = stage.to_successful();
-            // CARMA out-of-tree hook: fire the process-wide listener (if any)
-            // before reinserting, so the listener sees the freshly-completed
+            // CARMA out-of-tree hook: fan out to every registered listener
+            // before reinserting, so listeners see the freshly-completed
             // stage with no chance of overlap from later state changes.
-            if let Some(listener) =
-                crate::state::stage_listener::stage_completion_listener()
-            {
+            let listeners =
+                crate::state::stage_listener::stage_completion_listeners();
+            for listener in &listeners {
                 listener.on_stage_succeeded(
                     crate::state::stage_listener::StageCompletionContext {
                         job_id: &self.job_id,

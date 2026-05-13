@@ -16,27 +16,56 @@ The patch lives as one extra commit on top of the upstream base. Run
 
 ## What the patch does
 
-Exposes a per-stage completion event via a process-wide listener that
-the scheduler fires once per successful stage transition. Three files
-touched:
+Exposes a per-stage completion event via a process-wide multi-listener
+registry that the scheduler fires once per successful stage transition,
+plus a built-in metrics printer so the patched scheduler binary
+produces useful output on its own (env-var gated):
 
 ```
    NEW    ballista/scheduler/src/state/stage_listener.rs
               StageCompletionListener trait
               StageCompletionContext<'a> snapshot type
-              OnceLock-backed process-wide listener registry
+              Multi-listener registry (RwLock<Vec<Arc<dyn ...>>>)
+              add_stage_completion_listener(...)
+
+   NEW    ballista/scheduler/src/state/stage_metrics_printer.rs
+              StageMetricsSummary  — portable per-stage shape
+                                     (wall-clock, cpu-time, shuffle
+                                     rows/bytes/batches, task fan-out,
+                                     plan one-liner)
+              JobMetricsSummary    — rollup emitted on the root stage
+              PrintingStageListener (JSON or pretty, writes to stdout)
+              install_from_env()   — reads BALLISTA_STAGE_METRICS
 
    MOD    ballista/scheduler/src/state/mod.rs
               `pub mod stage_listener;`
+              `pub mod stage_metrics_printer;`
 
    MOD    ballista/scheduler/src/state/execution_graph.rs
-              StaticExecutionGraph::succeed_stage now fires the listener
-              once per stage, before reinserting it as Successful.
-              (Search for `CARMA out-of-tree hook` to find the call site.)
+              StaticExecutionGraph::succeed_stage iterates all
+              registered listeners, before reinserting the stage as
+              Successful. (Search for `CARMA out-of-tree hook`.)
+
+   MOD    ballista/scheduler/src/bin/main.rs
+              Calls stage_metrics_printer::install_from_env() right
+              after tracing init.
 ```
 
 No proto/gRPC changes. Stock Ballista executors at the same git rev
 remain protocol-compatible with this patched scheduler.
+
+## Running the patched scheduler with metrics
+
+```bash
+BALLISTA_STAGE_METRICS=json    ./target/release/ballista-scheduler   # one JSON line per stage
+BALLISTA_STAGE_METRICS=pretty  ./target/release/ballista-scheduler   # human-readable multi-line
+# unset / "off" / "0" / "false" / "no" → no metrics (default upstream behavior)
+```
+
+The JSON shape is intentionally Trino-/Spark-aligned (wall-clock ms,
+total cpu ns, shuffle output rows/bytes/batches, task fan-out, plan
+one-liner). Each stage emits a `{"kind":"stage", ...}` line; the root
+stage of each job also emits a `{"kind":"job", ...}` rollup line.
 
 ## Why a fork rather than upstream PR
 

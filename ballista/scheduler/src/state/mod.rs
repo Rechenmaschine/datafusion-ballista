@@ -66,6 +66,8 @@ pub mod executor_manager;
 pub mod session_manager;
 /// CARMA stage-completion listener hook (out-of-tree patch).
 pub mod stage_listener;
+/// CARMA built-in stage-metrics printer (out-of-tree patch).
+pub mod stage_metrics_printer;
 /// Task scheduling and lifecycle management.
 pub mod task_manager;
 

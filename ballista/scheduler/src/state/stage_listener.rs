@@ -10,20 +10,20 @@
 
 //! CARMA stage-completion listener hook.
 //!
-//! This module is part of the small CARMA-specific patch maintained on top of
-//! upstream Ballista. It exposes a process-wide listener that fires once when
-//! a `RunningStage` transitions to `SuccessfulStage`, with full read access to
-//! the stage's plan, partition metadata, task timings, and metrics.
+//! Part of the CARMA-specific patch maintained on top of upstream Ballista.
+//! Exposes process-wide listeners that fire once when a `RunningStage`
+//! transitions to `SuccessfulStage`, with full read access to the stage's
+//! plan, partition metadata, task timings, and metrics.
 //!
-//! The listener is installed via `set_stage_completion_listener` once at
-//! process startup and then runs inline from `StaticExecutionGraph::
-//! succeed_stage`. Use cases: capturing per-stage execution traces for
-//! offline analysis or simulation. CARMA's `carma-trace-ballista` crate
-//! installs a listener that converts each event into a normalized
-//! `BallistaTrace` record.
+//! Multiple listeners may be registered; they run in registration order from
+//! `StaticExecutionGraph::succeed_stage`. Typical install sites:
+//!   * the built-in metrics printer in `stage_metrics_printer` (env-gated),
+//!   * CARMA's `carma-trace-ballista` ClusterTraceWriter (cluster runs).
+//!
+//! Both can be active in the same process.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -54,16 +54,29 @@ pub struct StageCompletionContext<'a> {
     pub session_config: &'a SessionConfig,
 }
 
-static LISTENER: OnceLock<Arc<dyn StageCompletionListener>> = OnceLock::new();
+type ListenerVec = Vec<Arc<dyn StageCompletionListener>>;
 
-/// Install the process-wide stage-completion listener. Returns `Err` if a
-/// listener has already been installed (only one allowed per process).
-pub fn set_stage_completion_listener(
-    listener: Arc<dyn StageCompletionListener>,
-) -> Result<(), Arc<dyn StageCompletionListener>> {
-    LISTENER.set(listener)
+fn registry() -> &'static RwLock<ListenerVec> {
+    static REG: OnceLock<RwLock<ListenerVec>> = OnceLock::new();
+    REG.get_or_init(|| RwLock::new(Vec::new()))
 }
 
-pub(crate) fn stage_completion_listener() -> Option<&'static Arc<dyn StageCompletionListener>> {
-    LISTENER.get()
+/// Append a process-wide stage-completion listener. Multiple listeners may
+/// be registered and they fire in registration order.
+pub fn add_stage_completion_listener(listener: Arc<dyn StageCompletionListener>) {
+    let mut g = registry()
+        .write()
+        .expect("stage-listener registry poisoned");
+    g.push(listener);
+}
+
+/// Snapshot of currently-installed listeners. Returns an empty `Vec` if
+/// none are installed, so call sites can iterate unconditionally. Cloning
+/// the `Arc`s under a short read lock keeps the hot-path lock-free during
+/// dispatch.
+pub(crate) fn stage_completion_listeners() -> ListenerVec {
+    match registry().read() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
 }

@@ -80,6 +80,12 @@ async fn inner() -> ballista_core::error::Result<()> {
     } else {
         tracing.init();
     }
+
+    // CARMA: install the built-in stage-metrics printer if
+    // BALLISTA_STAGE_METRICS is set (no-op otherwise). Must come after
+    // tracing init so the install log line is visible.
+    ballista_scheduler::state::stage_metrics_printer::install_from_env();
+
     let addr = format!("{}:{}", opt.bind_host, opt.bind_port);
     let addr = addr.parse().map_err(|e: std::net::AddrParseError| {
         BallistaError::Configuration(e.to_string())
