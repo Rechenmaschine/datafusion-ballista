@@ -85,6 +85,11 @@ async fn inner() -> ballista_core::error::Result<()> {
     // BALLISTA_STAGE_METRICS is set (no-op otherwise). Must come after
     // tracing init so the install log line is visible.
     ballista_scheduler::state::stage_metrics_printer::install_from_env();
+    // CARMA: install the per-stage trace writer if BALLISTA_STAGE_TRACE_FILE
+    // is set (no-op otherwise). Emits one JSONL record per successful stage
+    // with per-task timing, executor placement, full plan tree, and input
+    // partition locations — the trace consumed by the CARMA cost model.
+    ballista_scheduler::state::stage_trace_writer::install_from_env();
 
     let addr = format!("{}:{}", opt.bind_host, opt.bind_port);
     let addr = addr.parse().map_err(|e: std::net::AddrParseError| {

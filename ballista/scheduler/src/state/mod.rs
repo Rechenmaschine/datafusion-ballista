@@ -68,6 +68,8 @@ pub mod session_manager;
 pub mod stage_listener;
 /// CARMA built-in stage-metrics printer (out-of-tree patch).
 pub mod stage_metrics_printer;
+/// CARMA per-stage trace writer (out-of-tree patch).
+pub mod stage_trace_writer;
 /// Task scheduling and lifecycle management.
 pub mod task_manager;
 
