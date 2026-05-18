@@ -1134,6 +1134,7 @@ dependencies = [
  "axum",
  "ballista-core",
  "clap 4.6.1",
+ "csv",
  "dashmap",
  "datafusion",
  "datafusion-proto",
