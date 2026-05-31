@@ -15,36 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::cluster::JobState;
 use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
-
+use crate::state::aqe::AdaptiveExecutionGraph;
+use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_graph::{
     ExecutionGraphBox, RunningTaskInfo, StaticExecutionGraph, TaskDescription,
 };
 use crate::state::executor_manager::ExecutorManager;
-
 use ballista_core::JobStatusSubscriber;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
-use datafusion::prelude::SessionConfig;
-use rand::distr::Alphanumeric;
-
-use crate::cluster::JobState;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
     JobStatus, MultiTaskDefinition, TaskDefinition, TaskId, TaskStatus, job_status,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use dashmap::DashMap;
-
-use crate::state::aqe::AdaptiveExecutionGraph;
+use datafusion::execution::config::SessionConfig;
+use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::{AsExecutionPlan, PhysicalExtensionCodec};
 use datafusion_proto::protobuf::PhysicalPlanNode;
 use log::{debug, error, info, trace, warn};
+use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -278,42 +277,47 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         &self,
         job_id: &str,
         job_name: &str,
-        session_id: &str,
-        plan: Arc<dyn ExecutionPlan>,
+        ctx: Arc<SessionContext>,
+        logical_plan: &LogicalPlan,
         queued_at: u64,
-        session_config: Arc<SessionConfig>,
         subscriber: Option<JobStatusSubscriber>,
-        logical_plan: Option<String>,
     ) -> Result<()> {
         let mut planner = DefaultDistributedPlanner::new();
-
+        let session_state = ctx.state();
+        let session_config = session_state.config();
         let mut graph = if session_config.ballista_adaptive_query_planner_enabled() {
             debug!("Using adaptive query planner (AQE) for job planning");
             warn!(
                 "Adaptive Query Planning is EXPERIMENTAL, should be used for testing purposes only!"
             );
-            Box::new(AdaptiveExecutionGraph::try_new(
-                &self.scheduler_id,
-                job_id,
-                job_name,
-                session_id,
-                plan,
-                queued_at,
-                session_config,
-                logical_plan,
-            )?) as ExecutionGraphBox
+            Box::new(
+                AdaptiveExecutionGraph::try_new(
+                    &self.scheduler_id,
+                    job_id,
+                    job_name,
+                    &ctx,
+                    logical_plan,
+                    queued_at,
+                )
+                .await?,
+            ) as ExecutionGraphBox
         } else {
             debug!("Using static query planner for job planning");
+            let session_config = Arc::new(ctx.copied_config());
+
+            let plan = ctx.state().create_physical_plan(logical_plan).await?;
+            let plan = handle_explain_plan(job_id, &ctx, logical_plan, plan).await?;
+
             Box::new(StaticExecutionGraph::new(
                 &self.scheduler_id,
                 job_id,
                 job_name,
-                session_id,
+                &ctx.session_id(),
                 plan,
                 queued_at,
                 session_config,
                 &mut planner,
-                logical_plan,
+                Some(logical_plan.display_indent().to_string()),
             )?) as ExecutionGraphBox
         };
 
@@ -435,6 +439,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
             Ok(graph)
         }
+    }
+
+    /// Get the session configuration for a job.
+    pub async fn get_job_config(&self, job_id: &str) -> Result<Arc<SessionConfig>> {
+        let graph = self
+            .get_job_execution_graph(job_id)
+            .await?
+            .ok_or_else(|| BallistaError::General(format!("Job {job_id} not found")))?;
+
+        Ok(graph.session_config())
     }
 
     /// Update given task statuses in the respective job and return a tuple containing:
