@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 
 use ballista_core::serde::protobuf::task_status;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::metrics::{MetricValue, MetricsSet};
 
 use crate::state::execution_stage::TaskInfo;
 use crate::state::stage_listener::{
@@ -176,11 +177,16 @@ fn write_record(out: &mut String, ctx: &StageCompletionContext<'_>) {
     }
     out.push_str("},\"tasks\":[");
     let mut first = true;
+    // `task_infos` is dense and indexed by partition, so the loop index `i` is
+    // this task's partition id. `stage_metrics` is indexed by *operator*, with
+    // each metric tagged by partition — so per-task compute is the sum of
+    // ElapsedCompute across all operators for partition `i` (NOT
+    // `stage_metrics[i]`, which would pick an unrelated operator).
     for (i, t) in ctx.task_infos.iter().enumerate() {
         if !first {
             out.push(',');
         }
-        write_task(out, t, ctx.stage_metrics.get(i));
+        write_task(out, t, task_compute_ns(ctx.stage_metrics, i));
         first = false;
     }
     out.push_str("],\"plan\":");
@@ -191,11 +197,30 @@ fn write_record(out: &mut String, ctx: &StageCompletionContext<'_>) {
     out.push('}');
 }
 
-fn write_task(
-    out: &mut String,
-    t: &TaskInfo,
-    metrics: Option<&datafusion::physical_plan::metrics::MetricsSet>,
-) {
+/// Sum DataFusion `ElapsedCompute` (ns) across every operator of the stage that
+/// recorded it for `partition` — i.e. one task's compute. Returns `None` if no
+/// operator reported compute for that partition.
+///
+/// Note: DataFusion's `elapsed_compute` is a wall-clock "busy-while-polling"
+/// timer, so for stages that read shuffle inputs it includes fetch/wait time and
+/// is not pure CPU; it is still the correct per-task aggregate of that metric.
+fn task_compute_ns(stage_metrics: &[MetricsSet], partition: usize) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut seen = false;
+    for op in stage_metrics {
+        for metric in op.iter() {
+            if metric.partition() == Some(partition) {
+                if let MetricValue::ElapsedCompute(time) = metric.value() {
+                    total = total.saturating_add(time.value() as u64);
+                    seen = true;
+                }
+            }
+        }
+    }
+    seen.then_some(total)
+}
+
+fn write_task(out: &mut String, t: &TaskInfo, compute_ns: Option<u64>) {
     use std::fmt::Write as _;
 
     let (status_label, executor_id, partitions) = match &t.task_status {
@@ -233,8 +258,7 @@ fn write_task(
         se = t.start_exec_time,
         ee = t.end_exec_time,
         fin = t.finish_time,
-        cpu = metrics
-            .and_then(|m| m.elapsed_compute())
+        cpu = compute_ns
             .map(|ns| ns.to_string())
             .unwrap_or_else(|| "null".into()),
     );
