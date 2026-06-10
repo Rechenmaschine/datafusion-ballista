@@ -20,6 +20,7 @@ mod logging;
 mod tui;
 
 use ballista::{extension::SessionConfigExt, prelude::SessionContextExt};
+use ballista_core::object_store::{runtime_env_with_s3_support, session_config_with_s3_support};
 use ballista_cli::{
     BALLISTA_CLI_VERSION, exec, print_format::PrintFormat, print_options::PrintOptions,
 };
@@ -142,12 +143,18 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = match (args.host, args.port) {
         (Some(ref host), Some(port)) => {
             let address = format!("df://{host}:{port}");
+            let mut cfg = session_config_with_s3_support();
+            if let Some(batch_size) = args.batch_size {
+                cfg = cfg.with_batch_size(batch_size);
+            }
+            let rt = runtime_env_with_s3_support(&cfg)?;
             let state = SessionStateBuilder::new()
-                .with_config(ballista_config)
+                .with_config(cfg)
+                .with_runtime_env(rt)
                 .with_default_features()
                 .build();
 
-            // Distributed execution with Ballista Remote
+            // Distributed execution with Ballista Remote (S3-enabled session)
             SessionContext::remote_with_state(&address, state).await?
         }
         _ => {

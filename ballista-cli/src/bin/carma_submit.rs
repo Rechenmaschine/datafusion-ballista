@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use ballista::extension::SessionConfigExt;
 use ballista::prelude::SessionContextExt;
+use ballista_core::object_store::{runtime_env_with_s3_support, session_config_with_s3_support};
 use clap::Parser;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -40,9 +40,14 @@ struct Args {
 }
 
 async fn connect(host: &str, port: u16) -> Result<SessionContext, BoxErr> {
-    let cfg = SessionConfig::new_with_ballista().with_information_schema(true);
+    // S3-enabled session so `CREATE EXTERNAL TABLE ... LOCATION 's3://...'`
+    // infers schema client-side (object store built from AWS_* env). Mirrors the
+    // scheduler/executor registry; harmless for local-path tables.
+    let cfg = session_config_with_s3_support();
+    let rt = runtime_env_with_s3_support(&cfg)?;
     let state = SessionStateBuilder::new()
         .with_config(cfg)
+        .with_runtime_env(rt)
         .with_default_features()
         .build();
     Ok(SessionContext::remote_with_state(&format!("df://{host}:{port}"), state).await?)

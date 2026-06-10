@@ -30,6 +30,7 @@ readme = "README.md"
 
 [dependencies]
 ballista = { path = "../ballista/client", version = "53.0.0", features = ["standalone"] }
+ballista-core = { path = "../ballista/core", features = ["build-binary"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"], optional = true }
 clap = { workspace = true, features = ["derive", "cargo"] }
 config = { version = "0.15.23", default-features = false, features = ["yaml"], optional = true }
