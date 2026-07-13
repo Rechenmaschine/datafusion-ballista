@@ -14,7 +14,9 @@
 //! successful stage to a file. Captures per-task timing + executor placement,
 //! the full physical plan tree of the stage, the upstream stage outputs that
 //! fed it (with executor placement of each input partition), and per-task
-//! shuffle-write partition stats. Designed for thesis-grade cost-model traces.
+//! shuffle-write partition stats, and per-task storage read bytes
+//! (`scan_bytes`, from the parquet source's `bytes_scanned` metric). Designed
+//! for thesis-grade cost-model traces.
 //!
 //! Companion to `stage_metrics_printer` — that one emits aggregated per-stage
 //! summaries; this one emits the full per-task record. Both can be installed
@@ -186,7 +188,12 @@ fn write_record(out: &mut String, ctx: &StageCompletionContext<'_>) {
         if !first {
             out.push(',');
         }
-        write_task(out, t, task_compute_ns(ctx.stage_metrics, i));
+        write_task(
+            out,
+            t,
+            task_compute_ns(ctx.stage_metrics, i),
+            task_scan_bytes(ctx.stage_metrics, i),
+        );
         first = false;
     }
     out.push_str("],\"plan\":");
@@ -220,7 +227,38 @@ fn task_compute_ns(stage_metrics: &[MetricsSet], partition: usize) -> Option<u64
     seen.then_some(total)
 }
 
-fn write_task(out: &mut String, t: &TaskInfo, compute_ns: Option<u64>) {
+/// Sum the parquet source's `bytes_scanned` counters for `partition` — the
+/// bytes this task actually fetched from storage (byte ranges requested from
+/// the object store / file, i.e. compressed on-disk bytes after projection and
+/// row-group pruning). Registered per scanned file by DataFusion's
+/// `ParquetFileMetrics` as a partition-tagged named `Count`, which survives the
+/// executor→scheduler metrics round-trip like any other metric. Returns `None`
+/// for tasks with no parquet scan (shuffle-fed stages), as opposed to a scan
+/// task that read 0 bytes.
+fn task_scan_bytes(stage_metrics: &[MetricsSet], partition: usize) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut seen = false;
+    for op in stage_metrics {
+        for metric in op.iter() {
+            if metric.partition() == Some(partition) {
+                if let MetricValue::Count { name, count } = metric.value() {
+                    if name == "bytes_scanned" {
+                        total = total.saturating_add(count.value() as u64);
+                        seen = true;
+                    }
+                }
+            }
+        }
+    }
+    seen.then_some(total)
+}
+
+fn write_task(
+    out: &mut String,
+    t: &TaskInfo,
+    compute_ns: Option<u64>,
+    scan_bytes: Option<u64>,
+) {
     use std::fmt::Write as _;
 
     let (status_label, executor_id, partitions) = match &t.task_status {
@@ -246,6 +284,7 @@ fn write_task(out: &mut String, t: &TaskInfo, compute_ns: Option<u64>) {
          \"end_exec_ms\":{ee},\
          \"finish_ms\":{fin},\
          \"elapsed_compute_ns\":{cpu},\
+         \"scan_bytes\":{scan},\
          \"partitions\":[",
         tid = t.task_id,
         status = json_str(status_label),
@@ -260,6 +299,9 @@ fn write_task(out: &mut String, t: &TaskInfo, compute_ns: Option<u64>) {
         fin = t.finish_time,
         cpu = compute_ns
             .map(|ns| ns.to_string())
+            .unwrap_or_else(|| "null".into()),
+        scan = scan_bytes
+            .map(|b| b.to_string())
             .unwrap_or_else(|| "null".into()),
     );
     if let Some(ps) = partitions {
@@ -280,6 +322,39 @@ fn write_task(out: &mut String, t: &TaskInfo, compute_ns: Option<u64>) {
         }
     }
     out.push_str("]}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::physical_plan::metrics::{Count, Metric};
+    use std::borrow::Cow;
+
+    fn count_metric(name: &'static str, value: usize, partition: usize) -> Arc<Metric> {
+        let count = Count::new();
+        count.add(value);
+        Arc::new(Metric::new(
+            MetricValue::Count {
+                name: Cow::Borrowed(name),
+                count,
+            },
+            Some(partition),
+        ))
+    }
+
+    #[test]
+    fn scan_bytes_sums_per_partition_and_ignores_other_counters() {
+        let mut op = MetricsSet::new();
+        op.push(count_metric("bytes_scanned", 100, 0));
+        op.push(count_metric("bytes_scanned", 40, 0)); // second file, same task
+        op.push(count_metric("bytes_scanned", 7, 1)); // another task
+        op.push(count_metric("row_groups_pruned_statistics", 5, 0));
+        let sets = vec![op];
+        assert_eq!(task_scan_bytes(&sets, 0), Some(140));
+        assert_eq!(task_scan_bytes(&sets, 1), Some(7));
+        // no scan metric for this partition → null, not 0
+        assert_eq!(task_scan_bytes(&sets, 2), None);
+    }
 }
 
 /// Minimal JSON string encoder — escapes `"`, `\`, control chars. Avoids
